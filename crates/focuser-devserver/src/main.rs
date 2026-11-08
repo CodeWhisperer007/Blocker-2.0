@@ -10,7 +10,8 @@
 //! so nearly all behaviour can be tested without a human.
 //!
 //! ```text
-//!   browser (localhost:1420)  ──HTTP──>  devserver (17550)  ──>  execute()
+//!   browser (localhost:1420)  ──HTTP──>  devserver (17549)  ──>  execute()
+//!   extension                 ──HTTP──>  devserver (17549)  ──>  execute()
 //!   Tauri webview             ──IPC───>  #[tauri::command]   ──>  execute()
 //!   terminal                  ──────────>  clap subcommand    ──>  execute()
 //! ```
@@ -28,13 +29,19 @@ use focuser_app::{AppContext, Command, execute};
 use focuser_core::{BlockEngine, Database};
 use tracing::{Level, error, info, warn};
 
-/// Deliberately not 17549 — that port is contested by the service's IPC
-/// listener and the Tauri app's extension API, and inheriting that collision
-/// in a dev tool would only confuse debugging.
-const DEFAULT_PORT: u16 = 17550;
+mod api;
+
+/// The extension's fixed endpoint (see `extension/lib/api.ts`). The devserver
+/// now serves the extension API as well as the web frontend, so this is the
+/// port both clients expect. If the desktop app is running it already holds
+/// this port; stop it first.
+const DEFAULT_PORT: u16 = 17549;
 
 /// The Vite dev server. Only this origin is allowed through CORS.
 const DEV_ORIGIN: &str = "http://localhost:1420";
+
+/// Vite is reachable under either loopback name; both are still the dev UI.
+const DEV_ORIGIN_LOOPBACK: &str = "http://127.0.0.1:1420";
 
 #[derive(Parser)]
 #[command(
@@ -81,15 +88,20 @@ fn main() {
 
     let engine = BlockEngine::new(db).expect("failed to build engine");
     // Headless: no hosts-file writes. A dev server must never edit the real
-    // system hosts file as a side effect of a UI click.
-    let ctx = Arc::new(AppContext::new_headless(engine));
+    // system hosts file as a side effect of a UI click. It does still report
+    // connected extensions so website allowances can count down.
+    let ctx = Arc::new(AppContext::new(engine, Arc::new(api::DevSync)));
 
     let addr = format!("127.0.0.1:{}", cli.port);
     let listener = TcpListener::bind(&addr).unwrap_or_else(|e| {
         panic!("cannot bind {addr}: {e}");
     });
 
-    info!(%addr, origin = DEV_ORIGIN, "devserver ready — POST /command");
+    info!(
+        %addr,
+        origin = DEV_ORIGIN,
+        "devserver ready — POST /command (frontend) and /api/* (extension)"
+    );
 
     for stream in listener.incoming() {
         match stream {
@@ -169,8 +181,12 @@ fn handle(mut stream: TcpStream, ctx: &AppContext) -> std::io::Result<()> {
     let method = parts.next().unwrap_or_default().to_string();
     let path = parts.next().unwrap_or_default().to_string();
 
-    // Headers — we only care about Content-Length.
+    // Headers we care about. Header names are case-insensitive per RFC 9110.
     let mut content_length = 0usize;
+    let mut content_type: Option<String> = None;
+    let mut origin: Option<String> = None;
+    let mut focuser_browser: Option<String> = None;
+    let mut if_none_match: Option<String> = None;
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line)? == 0 {
@@ -180,30 +196,100 @@ fn handle(mut stream: TcpStream, ctx: &AppContext) -> std::io::Result<()> {
         if line.is_empty() {
             break;
         }
-        // Header names are case-insensitive per RFC 9110.
-        let lower = line.to_ascii_lowercase();
-        if let Some(v) = lower.strip_prefix("content-length:") {
-            content_length = v.trim().parse().unwrap_or(0);
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        match name.trim().to_ascii_lowercase().as_str() {
+            "content-length" => content_length = value.parse().unwrap_or(0),
+            "content-type" => content_type = Some(value.to_string()),
+            "origin" => origin = Some(value.to_string()),
+            "x-focuser-browser" => focuser_browser = Some(value.to_string()),
+            "if-none-match" => if_none_match = Some(value.to_string()),
+            _ => {}
         }
+    }
+
+    // Read the body once, before routing: both `/command` and some `/api/*`
+    // endpoints take one.
+    let mut body = String::new();
+    if content_length > 0 {
+        let mut buf = vec![0u8; content_length];
+        reader.read_exact(&mut buf)?;
+        body = String::from_utf8_lossy(&buf).to_string();
+    }
+
+    // Every mutating endpoint expects JSON. Requiring it is a CSRF guard: a
+    // `text/plain` POST is a "simple" request that skips CORS preflight, so
+    // without this any web page could drive the local API blind. `fetch` with
+    // `Content-Type: application/json` is not simple, so its preflight hits the
+    // origin check below and a foreign origin is refused.
+    if method == "POST" && !is_json(content_type.as_deref()) {
+        return respond(
+            &mut stream,
+            415,
+            r#"{"error":"Content-Type must be application/json"}"#,
+            Some("application/json"),
+            &[],
+            allowed_origin(
+                origin.as_deref(),
+                path == "/api" || path.starts_with("/api/"),
+            ),
+        );
+    }
+
+    // The extension's half of the surface lives on the same port as the web
+    // frontend's. Everything under `/api/` goes to the ported desktop handlers.
+    if path == "/api" || path.starts_with("/api/") {
+        let response = api::handle(
+            &method,
+            &path,
+            &body,
+            focuser_browser.as_deref(),
+            if_none_match.as_deref(),
+            ctx,
+        );
+        let allow = allowed_origin(origin.as_deref(), true);
+        return respond(
+            &mut stream,
+            response.status,
+            &response.body,
+            Some("application/json"),
+            &response.headers,
+            allow,
+        );
     }
 
     match (method.as_str(), path.as_str()) {
         // Preflight for the Vite origin.
-        ("OPTIONS", _) => respond(&mut stream, 204, "", None),
+        ("OPTIONS", _) => respond(
+            &mut stream,
+            204,
+            "",
+            None,
+            &[],
+            allowed_origin(origin.as_deref(), false),
+        ),
 
         ("GET", "/health") => respond(
             &mut stream,
             200,
             &serde_json::json!({ "ok": true }).to_string(),
             Some("application/json"),
+            &[],
+            allowed_origin(origin.as_deref(), false),
         ),
 
         ("POST", "/command") => {
-            let mut body = vec![0u8; content_length];
-            reader.read_exact(&mut body)?;
-
-            let (status, payload) = run_command(ctx, &body);
-            respond(&mut stream, status, &payload, Some("application/json"))
+            let (status, payload) = run_command(ctx, body.as_bytes());
+            respond(
+                &mut stream,
+                status,
+                &payload,
+                Some("application/json"),
+                &[],
+                allowed_origin(origin.as_deref(), false),
+            )
         }
 
         _ => respond(
@@ -211,8 +297,41 @@ fn handle(mut stream: TcpStream, ctx: &AppContext) -> std::io::Result<()> {
             404,
             &serde_json::json!({ "error": "not found" }).to_string(),
             Some("application/json"),
+            &[],
+            allowed_origin(origin.as_deref(), false),
         ),
     }
+}
+
+/// Which `Origin` may read the response.
+///
+/// `/command` and `/health` are for the Vite dev UI. `/api/*` is for the
+/// extension, whose origin is a per-install `chrome-extension://` /
+/// `moz-extension://` id — much safer than the desktop app's
+/// `Access-Control-Allow-Origin: *`, which let any web page mutate block lists.
+/// A request with no origin needs no CORS header at all (and the extension's
+/// `<all_urls>` host permission bypasses CORS anyway).
+fn allowed_origin(origin: Option<&str>, extension_api: bool) -> Option<&str> {
+    let origin = origin?;
+    if origin == DEV_ORIGIN || origin == DEV_ORIGIN_LOOPBACK {
+        return Some(origin);
+    }
+    if extension_api
+        && (origin.starts_with("chrome-extension://") || origin.starts_with("moz-extension://"))
+    {
+        return Some(origin);
+    }
+    None
+}
+
+/// Whether a request body claims to be JSON.
+///
+/// Parameters such as `; charset=utf-8` are ignored; only the media type
+/// matters for the CSRF guard above.
+fn is_json(content_type: Option<&str>) -> bool {
+    content_type
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("application/json"))
 }
 
 /// Deserialise a [`Command`], run it, and render the outcome as JSON.
@@ -267,25 +386,38 @@ fn respond(
     status: u16,
     body: &str,
     content_type: Option<&str>,
+    extra_headers: &[(String, String)],
+    allow_origin: Option<&str>,
 ) -> std::io::Result<()> {
     let reason = match status {
         200 => "OK",
         204 => "No Content",
+        302 => "Found",
+        304 => "Not Modified",
         400 => "Bad Request",
+        403 => "Forbidden",
         404 => "Not Found",
+        405 => "Method Not Allowed",
+        415 => "Unsupported Media Type",
         _ => "Internal Server Error",
     };
 
-    let mut head = format!(
-        "HTTP/1.1 {status} {reason}\r\n\
-         Access-Control-Allow-Origin: {DEV_ORIGIN}\r\n\
-         Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
-         Access-Control-Allow-Headers: Content-Type\r\n\
-         Content-Length: {len}\r\n",
-        len = body.len(),
-    );
+    let mut head = format!("HTTP/1.1 {status} {reason}\r\n");
+    if let Some(origin) = allow_origin {
+        head.push_str(&format!("Access-Control-Allow-Origin: {origin}\r\n"));
+        head.push_str("Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n");
+        head.push_str("Access-Control-Allow-Headers: Content-Type, X-Focuser-Browser\r\n");
+        head.push_str("Vary: Origin\r\n");
+    }
+
+    // A 304 has no body, and must not claim a length the full answer lacks.
+    let len = if status == 304 { 0 } else { body.len() };
+    head.push_str(&format!("Content-Length: {len}\r\n"));
     if let Some(ct) = content_type {
         head.push_str(&format!("Content-Type: {ct}\r\n"));
+    }
+    for (name, value) in extra_headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
     }
     head.push_str("Connection: close\r\n\r\n");
 
